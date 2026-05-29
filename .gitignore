@@ -1,0 +1,13 @@
+# Dependency directories
+node_modules/
+
+# Local session credentials (whatsapp-web.js state)
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Local configurations
+.env
+
+# OS-specific files
+.DS_Store
+Thumbs.db
