@@ -1,5 +1,5 @@
 const express = require('express');
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia, Location } = require('whatsapp-web.js');
 const qrcodeTerminal = require('qrcode-terminal');
 const QRCode = require('qrcode');
 const path = require('path');
@@ -12,7 +12,7 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || null;
+const API_KEY = process.env.API_KEY || 'Narzo50pro@gmail.com';
 
 // Track connection state & auto-recovery timer
 let connectionState = 'INITIALIZING'; // INITIALIZING, QR_REQUIRED, AUTHENTICATED, READY, FAILED, DISCONNECTED
@@ -421,6 +421,7 @@ app.get('/status', (req, res) => {
             </div>
             <pre class="code-container">curl -X POST http://${req.headers.host}/send \\
   -H "Content-Type: application/json" \\
+  -H "X-API-Key: ${API_KEY}" \\
   -d '{
     "number": "+917004430152",
     "message": "Hello from custom API!"
@@ -472,13 +473,14 @@ app.get('/status', (req, res) => {
 
 // REST API endpoint to send a message
 app.post('/send', authenticate, async (req, res) => {
-  const { number, message, mediaUrl, mediaBase64, mimetype, filename } = req.body;
+  const { number, message, mediaUrl, mediaBase64, mimetype, filename, latitude, longitude, name, address } = req.body;
 
-  // 1. Basic validation (requires number and at least one of: message, mediaUrl, or mediaBase64)
-  if (!number || (!message && !mediaUrl && !mediaBase64)) {
+  // 1. Basic validation (requires number and at least one payload type: message, mediaUrl, mediaBase64, or location coordinates)
+  const hasLocation = latitude !== undefined && longitude !== undefined;
+  if (!number || (!message && !mediaUrl && !mediaBase64 && !hasLocation)) {
     return res.status(400).json({ 
       success: false, 
-      error: 'Bad Request: "number" and either "message", "mediaUrl", or "mediaBase64" fields are required.' 
+      error: 'Bad Request: "number" and at least one of "message", "mediaUrl", "mediaBase64", or both "latitude" and "longitude" are required.' 
     });
   }
 
@@ -504,11 +506,33 @@ app.post('/send', authenticate, async (req, res) => {
       chatId = `${cleaned}@c.us`;
     }
 
-    // 4. Resolve Media Attachment if present
-    let media = null;
-    if (mediaUrl) {
+    let response;
+
+    // 4. Resolve and Send Location Card if provided
+    if (hasLocation) {
+      const latNum = parseFloat(latitude);
+      const lngNum = parseFloat(longitude);
+      
+      if (isNaN(latNum) || isNaN(lngNum)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Bad Request: "latitude" and "longitude" must be valid numbers.'
+        });
+      }
+      
+      console.log(`[WhatsApp API] Sending location card to ${chatId}: Lat ${latNum}, Lng ${lngNum} (${name || 'No Name'})`);
+      const locationObj = new Location(latNum, lngNum, {
+        name: name || '',
+        address: address || ''
+      });
+      response = await client.sendMessage(chatId, locationObj);
+    } 
+    // 5. Resolve and Send Media Attachment if provided
+    else if (mediaUrl) {
       console.log(`[WhatsApp API] Downloading attachment from URL: ${mediaUrl}`);
-      media = await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true });
+      const media = await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true });
+      console.log(`[WhatsApp API] Sending media to ${chatId} with caption: "${message || ''}"`);
+      response = await client.sendMessage(chatId, media, message ? { caption: message } : {});
     } else if (mediaBase64) {
       if (!mimetype) {
         return res.status(400).json({
@@ -517,15 +541,12 @@ app.post('/send', authenticate, async (req, res) => {
         });
       }
       console.log(`[WhatsApp API] Parsing Base64 media attachment (${mimetype})`);
-      media = new MessageMedia(mimetype, mediaBase64, filename || 'attachment');
-    }
-
-    let response;
-    if (media) {
+      const media = new MessageMedia(mimetype, mediaBase64, filename || 'attachment');
       console.log(`[WhatsApp API] Sending media to ${chatId} with caption: "${message || ''}"`);
-      // When sending media, message acts as the caption
       response = await client.sendMessage(chatId, media, message ? { caption: message } : {});
-    } else {
+    } 
+    // 6. Send Plain Text Message
+    else {
       console.log(`[WhatsApp API] Sending text message to ${chatId}: "${message}"`);
       response = await client.sendMessage(chatId, message);
     }
@@ -552,6 +573,7 @@ app.post('/send', authenticate, async (req, res) => {
 app.listen(PORT, () => {
   console.log(`[Server] WhatsApp Lite API Server running on http://localhost:${PORT}`);
   console.log(`[Server] Status & QR scanner dashboard available at http://localhost:${PORT}/status`);
+  console.log(`[Server] API Authentication Key is: ${API_KEY}`);
 });
 
 // Clean shutdown handler to prevent lingering Chromium processes and locked sessions

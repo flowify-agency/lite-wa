@@ -78,14 +78,14 @@ Checks current connection state and exposes QR code if login is required.
   }
   ```
 
-### 2. Send Message (Text & File Attachments)
-Sends a plain text message, a file attachment from a URL, or a file attachment from a Base64-encoded string. If a `message` is passed alongside media, it will be delivered as the caption of that media.
+### 2. Send Message (Text, Files, & Location Maps)
+Sends a plain text message, a file attachment from a URL, a file attachment from a Base64-encoded string, or a native interactive location map card. If a `message` is passed alongside media, it will be delivered as the caption of that media.
 
 - **URL:** `/send`
 - **Method:** `POST`
 - **Headers:** 
   - `Content-Type: application/json`
-  - `X-API-Key: your_optional_secret_api_key` (if `API_KEY` is set in `.env`)
+  - `X-API-Key: Narzo50pro@gmail.com` (Static API Key pre-set by default in `index.js`)
 
 #### Request Payloads
 
@@ -114,6 +114,17 @@ Sends a plain text message, a file attachment from a URL, or a file attachment f
   "mimetype": "image/png",
   "filename": "pixel.png",
   "message": "Here is a tiny transparent pixel image!"
+}
+```
+
+##### Option D: Send Location Map Card
+```json
+{
+  "number": "+1 234 567 8900",
+  "latitude": 27.1751,
+  "longitude": 78.0421,
+  "name": "Taj Mahal",
+  "address": "Dharmapuri, Forest Colony, Tajganj, Agra, Uttar Pradesh 282001"
 }
 ```
 
