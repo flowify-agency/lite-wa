@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  whatsapp-api:
+    image: node:22-slim
+    container_name: whatsapp-lite-api
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      # Mounts the current directory into the container
+      - .:/usr/src/app
+      # Exclude node_modules from host to prevent OS-level architecture conflicts
+      - /usr/src/app/node_modules
+    working_dir: /usr/src/app
+    # Set Puppeteer executable path to the container-installed Chromium
+    environment:
+      - PORT=3000
+      - PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+      - PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+      - API_KEY= # Set your secret API key here to secure the endpoints
+    # Inline command that installs Chromium dependencies and starts the API
+    command: >
+      sh -c "
+      apt-get update &&
+      apt-get install -y chromium fonts-liberation libnss3 xdg-utils &&
+      npm install &&
+      npm start
+      "

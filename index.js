@@ -1,5 +1,5 @@
 const express = require('express');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcodeTerminal = require('qrcode-terminal');
 const QRCode = require('qrcode');
 const path = require('path');
@@ -14,11 +14,12 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || null;
 
-// Track connection state
+// Track connection state & auto-recovery timer
 let connectionState = 'INITIALIZING'; // INITIALIZING, QR_REQUIRED, AUTHENTICATED, READY, FAILED, DISCONNECTED
 let currentQrData = null;
 let currentQrBase64 = null;
 let clientInfo = null;
+let readyTimeout = null;
 
 // Initialize WhatsApp client with robust Puppeteer flags (derived from OpenWA's production config)
 const client = new Client({
@@ -29,6 +30,7 @@ const client = new Client({
   puppeteer: {
     headless: true,
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -71,16 +73,35 @@ client.on('authenticated', () => {
   connectionState = 'AUTHENTICATED';
   currentQrData = null;
   currentQrBase64 = null;
-  console.log('[WhatsApp API] Authentication successful! Loading session...');
+  console.log('[WhatsApp API] Authentication successful! Syncing session...');
+
+  // Setup auto-recovery watchdog: if we don't reach READY within 25 seconds,
+  // trigger a background reload of the page to kickstart the sync.
+  if (readyTimeout) clearTimeout(readyTimeout);
+  readyTimeout = setTimeout(async () => {
+    if (connectionState === 'AUTHENTICATED') {
+      console.log('[WhatsApp API] Initialization sync is taking longer than expected. Performing an automatic background refresh...');
+      try {
+        if (client.pupPage) {
+          await client.pupPage.reload();
+          console.log('[WhatsApp API] Page refreshed successfully. Resuming sync...');
+        }
+      } catch (err) {
+        console.error('[WhatsApp API] Automatic background refresh failed:', err.message);
+      }
+    }
+  }, 15000); // 15 seconds
 });
 
 client.on('auth_failure', (msg) => {
   connectionState = 'FAILED';
+  if (readyTimeout) clearTimeout(readyTimeout);
   console.error('[WhatsApp API] Authentication failed:', msg);
 });
 
 client.on('ready', () => {
   connectionState = 'READY';
+  if (readyTimeout) clearTimeout(readyTimeout);
   clientInfo = {
     number: client.info.wid.user,
     pushname: client.info.pushname
@@ -90,6 +111,7 @@ client.on('ready', () => {
 
 client.on('disconnected', (reason) => {
   connectionState = 'DISCONNECTED';
+  if (readyTimeout) clearTimeout(readyTimeout);
   clientInfo = null;
   currentQrData = null;
   currentQrBase64 = null;
@@ -124,7 +146,7 @@ const authenticate = (req, res, next) => {
   });
 };
 
-// Expose /status with premium Glassmorphism Dark Theme
+// Expose /status with premium Stripe/Vercel-style Dev Console
 app.get('/status', (req, res) => {
   const isHtmlRequested = req.accepts('html', 'json') === 'html';
   
@@ -140,28 +162,32 @@ app.get('/status', (req, res) => {
     return res.json(statusPayload);
   }
 
-  // Generate responsive premium dark HTML layout with modern typography and gradients
+  // Generate a beautiful, clean, hand-crafted developer console (no AI clichés)
   const html = `
     <!DOCTYPE html>
     <html lang="en">
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>WhatsApp API Gateway - Status</title>
+      <title>WhatsApp API Console</title>
       <link rel="preconnect" href="https://fonts.googleapis.com">
       <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-      <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+      <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
       <style>
         :root {
-          --primary: #10b981;
-          --primary-glow: rgba(16, 185, 129, 0.15);
-          --danger: #ef4444;
-          --warning: #f59e0b;
-          --dark-bg: #0b0f19;
-          --glass-bg: rgba(17, 24, 39, 0.7);
-          --glass-border: rgba(255, 255, 255, 0.08);
-          --text-primary: #f8fafc;
-          --text-secondary: #94a3b8;
+          --bg: #090d16;
+          --panel: #111827;
+          --border: #1f2937;
+          --text-primary: #f9fafb;
+          --text-secondary: #9ca3af;
+          --green: #10b981;
+          --green-bg: rgba(16, 185, 129, 0.1);
+          --amber: #f59e0b;
+          --amber-bg: rgba(245, 158, 11, 0.1);
+          --red: #ef4444;
+          --red-bg: rgba(239, 68, 68, 0.1);
+          --blue: #3b82f6;
+          --blue-bg: rgba(59, 130, 246, 0.1);
         }
 
         * {
@@ -171,142 +197,121 @@ app.get('/status', (req, res) => {
         }
 
         body {
-          font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
-          background-color: var(--dark-bg);
-          background-image: 
-            radial-gradient(circle at 10% 20%, rgba(16, 185, 129, 0.05) 0%, transparent 40%),
-            radial-gradient(circle at 90% 80%, rgba(99, 102, 241, 0.05) 0%, transparent 40%);
+          font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+          background-color: var(--bg);
           color: var(--text-primary);
           min-height: 100vh;
           display: flex;
           align-items: center;
           justify-content: center;
-          padding: 2rem 1rem;
-          overflow-x: hidden;
+          padding: 1.5rem;
         }
 
-        .container {
+        .card {
           width: 100%;
-          max-width: 480px;
-          background: var(--glass-bg);
-          backdrop-filter: blur(20px);
-          -webkit-backdrop-filter: blur(20px);
-          border: 1px solid var(--glass-border);
-          border-radius: 24px;
-          padding: 2.5rem;
-          box-shadow: 0 20px 40px -15px rgba(0, 0, 0, 0.5);
-          text-align: center;
-          position: relative;
+          max-width: 520px;
+          background-color: var(--panel);
+          border: 1px solid var(--border);
+          border-radius: 12px;
+          padding: 2.25rem;
+          box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
         }
 
         .header {
-          margin-bottom: 2rem;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          border-bottom: 1px solid var(--border);
+          padding-bottom: 1.25rem;
+          margin-bottom: 1.5rem;
         }
 
-        .logo {
-          font-size: 1.75rem;
-          font-weight: 800;
-          background: linear-gradient(135deg, #10b981 0%, #3b82f6 100%);
-          -webkit-background-clip: text;
-          -webkit-text-fill-color: transparent;
-          margin-bottom: 0.5rem;
-          letter-spacing: -0.025em;
-        }
-
-        .subtitle {
-          color: var(--text-secondary);
-          font-size: 0.875rem;
-          font-weight: 500;
-        }
-
-        .status-badge {
-          display: inline-flex;
+        .brand-title {
+          font-size: 1.125rem;
+          font-weight: 600;
+          letter-spacing: -0.01em;
+          display: flex;
           align-items: center;
           gap: 0.5rem;
-          padding: 0.625rem 1.25rem;
-          border-radius: 9999px;
-          font-size: 0.875rem;
-          font-weight: 700;
-          text-transform: uppercase;
-          letter-spacing: 0.05em;
-          margin-bottom: 2rem;
-          box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-          transition: all 0.3s ease;
         }
 
-        /* Statuses */
-        .status-INITIALIZING {
-          background-color: rgba(59, 130, 246, 0.1);
-          color: #3b82f6;
-          border: 1px solid rgba(59, 130, 246, 0.2);
-        }
-        .status-QR_REQUIRED {
-          background-color: rgba(245, 158, 11, 0.1);
-          color: var(--warning);
-          border: 1px solid rgba(245, 158, 11, 0.2);
-          animation: pulse 2s infinite;
-        }
-        .status-AUTHENTICATED {
-          background-color: rgba(16, 185, 129, 0.1);
-          color: var(--primary);
-          border: 1px solid rgba(16, 185, 129, 0.2);
-        }
-        .status-READY {
-          background-color: rgba(16, 185, 129, 0.15);
-          color: var(--primary);
-          border: 1px solid rgba(16, 185, 129, 0.3);
-          box-shadow: 0 0 15px var(--primary-glow);
-        }
-        .status-FAILED, .status-DISCONNECTED {
-          background-color: rgba(239, 68, 68, 0.1);
-          color: var(--danger);
-          border: 1px solid rgba(239, 68, 68, 0.2);
-        }
-
-        .qr-container {
-          background: #ffffff;
-          padding: 1.5rem;
-          border-radius: 20px;
+        .status-dot {
+          width: 8px;
+          height: 8px;
+          border-radius: 50%;
           display: inline-block;
-          margin: 0.5rem auto 2rem;
-          box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
-          transition: transform 0.3s ease;
         }
 
-        .qr-container:hover {
-          transform: scale(1.02);
+        .dot-INITIALIZING { background-color: var(--blue); }
+        .dot-QR_REQUIRED { background-color: var(--amber); }
+        .dot-AUTHENTICATED { background-color: var(--blue); }
+        .dot-READY { background-color: var(--green); }
+        .dot-FAILED, .dot-DISCONNECTED { background-color: var(--red); }
+
+        .badge {
+          font-size: 0.75rem;
+          font-weight: 500;
+          padding: 0.25rem 0.75rem;
+          border-radius: 6px;
+          text-transform: uppercase;
+          letter-spacing: 0.025em;
+          display: inline-flex;
+          align-items: center;
+          gap: 0.375rem;
+        }
+
+        .badge-INITIALIZING { background-color: var(--blue-bg); color: var(--blue); }
+        .badge-QR_REQUIRED { background-color: var(--amber-bg); color: var(--amber); }
+        .badge-AUTHENTICATED { background-color: var(--blue-bg); color: var(--blue); }
+        .badge-READY { background-color: var(--green-bg); color: var(--green); }
+        .badge-FAILED, .badge-DISCONNECTED { background-color: var(--red-bg); color: var(--red); }
+
+        .content-section {
+          margin-bottom: 1.5rem;
+        }
+
+        .instruction-text {
+          font-size: 0.875rem;
+          line-height: 1.5;
+          color: var(--text-secondary);
+          margin-bottom: 1.25rem;
+        }
+
+        .qr-wrapper {
+          background-color: #ffffff;
+          padding: 1.25rem;
+          border-radius: 8px;
+          display: flex;
+          justify-content: center;
+          align-items: center;
+          margin: 1rem auto 1.5rem;
+          width: fit-content;
+          border: 1px solid var(--border);
         }
 
         .qr-image {
           display: block;
-          max-width: 250px;
-          height: auto;
+          width: 240px;
+          height: 240px;
         }
 
-        .success-illustration {
-          font-size: 5rem;
-          margin: 1.5rem 0 2rem;
-          animation: scaleUp 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-        }
-
-        .success-info {
-          background: rgba(255, 255, 255, 0.02);
-          border: 1px solid rgba(255, 255, 255, 0.05);
-          border-radius: 16px;
-          padding: 1.25rem;
-          margin-bottom: 2rem;
-          text-align: left;
+        .info-grid {
+          background-color: rgba(255, 255, 255, 0.015);
+          border: 1px solid var(--border);
+          border-radius: 8px;
+          padding: 1rem;
+          margin-bottom: 1.5rem;
         }
 
         .info-row {
           display: flex;
           justify-content: space-between;
-          margin-bottom: 0.75rem;
-          font-size: 0.935rem;
+          padding: 0.5rem 0;
+          font-size: 0.875rem;
         }
 
-        .info-row:last-child {
-          margin-bottom: 0;
+        .info-row:not(:last-child) {
+          border-bottom: 1px solid var(--border);
         }
 
         .info-label {
@@ -314,116 +319,137 @@ app.get('/status', (req, res) => {
         }
 
         .info-value {
-          font-weight: 600;
-          color: var(--text-primary);
+          font-weight: 500;
         }
 
-        .instructions {
-          font-size: 0.95rem;
-          line-height: 1.6;
-          color: var(--text-secondary);
-          margin-bottom: 1rem;
-        }
-
-        .instructions strong {
-          color: var(--text-primary);
-        }
-
-        .curl-example {
-          background: #040711;
-          border: 1px solid var(--glass-border);
-          border-radius: 12px;
-          padding: 1rem;
-          text-align: left;
-          font-family: 'JetBrains Mono', monospace;
+        .code-box-title {
           font-size: 0.75rem;
-          overflow-x: auto;
-          color: #a7f3d0;
-          white-space: pre-wrap;
-          word-break: break-all;
-        }
-
-        .curl-header {
-          display: flex;
-          justify-content: space-between;
+          font-weight: 600;
           color: var(--text-secondary);
-          font-size: 0.7rem;
+          margin-bottom: 0.5rem;
           text-transform: uppercase;
           letter-spacing: 0.05em;
-          margin-bottom: 0.5rem;
-          font-weight: 600;
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
         }
 
-        @keyframes pulse {
-          0%, 100% { opacity: 1; transform: scale(1); }
-          50% { opacity: 0.9; transform: scale(0.98); }
+        .code-container {
+          background-color: #04060a;
+          border: 1px solid var(--border);
+          border-radius: 8px;
+          padding: 1rem;
+          font-family: 'Fira Code', monospace;
+          font-size: 0.75rem;
+          line-height: 1.5;
+          color: #a7f3d0; /* emerald-200 */
+          overflow-x: auto;
+          text-align: left;
+          white-space: pre;
         }
 
-        @keyframes scaleUp {
-          from { transform: scale(0.8); opacity: 0; }
-          to { transform: scale(1); opacity: 1; }
+        .footer-note {
+          font-size: 0.75rem;
+          color: var(--text-secondary);
+          text-align: center;
+          margin-top: 1.5rem;
+          display: flex;
+          justify-content: center;
+          align-items: center;
+          gap: 0.375rem;
+        }
+
+        .svg-icon {
+          width: 14px;
+          height: 14px;
+          fill: none;
+          stroke: currentColor;
+          stroke-width: 2;
         }
       </style>
     </head>
     <body>
-      <div class="container">
+      <div class="card">
         <div class="header">
-          <div class="logo">WhatsApp API Gateway</div>
-          <div class="subtitle">Fast & Lightweight Automation Server</div>
+          <h1 class="brand-title">
+            <svg class="svg-icon" style="width:18px; height:18px; color:var(--green);" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M8.684 10.742h.008v.008h-.008v-.008zm.37 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H8.25m4.125 0h.008v.008h-.008v-.008zm.371 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0h-.372m4.125 0h.008v.008h-.008v-.008zm.371 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0h-.371M21 12c0 1.268-.63 2.39-1.593 3.068a3.745 3.745 0 01-1.043 3.296 3.745 3.745 0 01-3.296 1.043A3.745 3.745 0 0112 21c-1.268 0-2.39-.63-3.068-1.593a3.746 3.746 0 01-3.296-1.043 3.745 3.745 0 01-1.043-3.296A3.745 3.745 0 013 12c0-1.268.63-2.39 1.593-3.068a3.745 3.745 0 011.043-3.296 3.746 3.746 0 013.296-1.043A3.746 3.746 0 0112 3c1.268 0 2.39.63 3.068 1.593a3.746 3.746 0 013.296 1.043 3.746 3.746 0 011.043 3.296A3.745 3.745 0 0121 12z" />
+            </svg>
+            WhatsApp API Console
+          </h1>
+          <div class="badge badge-${connectionState}">
+            <span class="status-dot dot-${connectionState}"></span>
+            ${connectionState.replace('_', ' ')}
+          </div>
         </div>
 
-        <div class="status-badge status-${connectionState}">
-          <span style="display:inline-block; width: 8px; height: 8px; border-radius: 50%; background-color: currentColor;"></span>
-          ${connectionState.replace('_', ' ')}
-        </div>
-
-        ${connectionState === 'QR_REQUIRED' && currentQrBase64 ? `
-          <p class="instructions">Open WhatsApp on your phone, navigate to <strong>Linked Devices</strong>, and scan this QR code:</p>
-          <div class="qr-container">
-            <img class="qr-image" src="${currentQrBase64}" alt="Scan Me">
-          </div>
-        ` : ''}
-
-        ${['INITIALIZING', 'AUTHENTICATED'].includes(connectionState) ? `
-          <div class="success-illustration">⏳</div>
-          <p class="instructions" style="margin-bottom: 2rem;">Connecting and restoring WhatsApp session... Please hold.</p>
-        ` : ''}
-
-        ${connectionState === 'READY' ? `
-          <div class="success-illustration">⚡</div>
-          <div class="success-info">
-            <div class="info-row">
-              <span class="info-label">Connected Name:</span>
-              <span class="info-value">${clientInfo?.pushname || 'Unknown'}</span>
+        <div class="content-section">
+          ${connectionState === 'QR_REQUIRED' && currentQrBase64 ? `
+            <p class="instruction-text">To start automating, link a device by scanning this QR code in WhatsApp (Settings &rarr; Linked Devices):</p>
+            <div class="qr-wrapper">
+              <img class="qr-image" src="${currentQrBase64}" alt="QR code">
             </div>
-            <div class="info-row">
-              <span class="info-label">Connected Phone:</span>
-              <span class="info-value">+${clientInfo?.number || ''}</span>
+          ` : ''}
+
+          ${['INITIALIZING', 'AUTHENTICATED'].includes(connectionState) ? `
+            <p class="instruction-text" style="display:flex; align-items:center; gap:0.5rem;">
+              <svg class="svg-icon" style="animation: spin 1s linear infinite;" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
+              </svg>
+              Establishing connection and loading web session parameters...
+            </p>
+          ` : ''}
+
+          ${connectionState === 'READY' ? `
+            <div class="info-grid">
+              <div class="info-row">
+                <span class="info-label">Active Connection</span>
+                <span class="info-value">+${clientInfo?.number || ''} (${clientInfo?.pushname || 'No Name'})</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Engine Port</span>
+                <span class="info-value">:${PORT}</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Endpoints</span>
+                <span class="info-value">POST /send</span>
+              </div>
             </div>
-            <div class="info-row">
-              <span class="info-label">API Endpoints:</span>
-              <span class="info-value">POST /send</span>
+
+            <div class="code-box-title">
+              <span>Send Message Payload Reference</span>
             </div>
-          </div>
-          <p class="instructions" style="text-align:left; margin-bottom: 0.5rem;"><strong>Ready to Automate!</strong> Run the following test command:</p>
-          <div class="curl-header">Test HTTP curl request</div>
-          <pre class="curl-example">curl -X POST http://${req.headers.host}/send \\
+            <pre class="code-container">curl -X POST http://${req.headers.host}/send \\
   -H "Content-Type: application/json" \\
   -d '{
-    "number": "+1234567890",
-    "message": "Hello from API Gateway! 🚀"
+    "number": "+917004430152",
+    "message": "Hello from custom API!"
   }'</pre>
-        ` : ''}
+          ` : ''}
 
-        ${['FAILED', 'DISCONNECTED'].includes(connectionState) ? `
-          <div class="success-illustration" style="filter: hue-rotate(120deg);">❌</div>
-          <p class="instructions" style="margin-bottom: 2rem;">Connection disconnected or failed. Reconnecting in the background...</p>
-        ` : ''}
+          ${['FAILED', 'DISCONNECTED'].includes(connectionState) ? `
+            <p class="instruction-text" style="color:var(--red);">
+              Connection offline or lost. Re-establishing connection in the background...
+            </p>
+          ` : ''}
+        </div>
+
+        <div class="footer-note">
+          <svg class="svg-icon" style="color:var(--text-secondary);" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+          Standalone API Gateway • Active Node v${process.versions.node}
+        </div>
       </div>
 
+      <style>
+        @keyframes spin {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
+      </style>
+
       <script>
-        // Self-updating micro script: polls status every 3 seconds
-        // Reloads the page if connectionState changes to keep QR and details aligned.
         const originalState = "${connectionState}";
         setInterval(async () => {
           try {
@@ -433,7 +459,7 @@ app.get('/status', (req, res) => {
               window.location.reload();
             }
           } catch (e) {
-            console.error('Failed to poll status:', e);
+            console.error('API polling failure:', e);
           }
         }, 3000);
       </script>
@@ -446,13 +472,13 @@ app.get('/status', (req, res) => {
 
 // REST API endpoint to send a message
 app.post('/send', authenticate, async (req, res) => {
-  const { number, message } = req.body;
+  const { number, message, mediaUrl, mediaBase64, mimetype, filename } = req.body;
 
-  // 1. Basic validation
-  if (!number || !message) {
+  // 1. Basic validation (requires number and at least one of: message, mediaUrl, or mediaBase64)
+  if (!number || (!message && !mediaUrl && !mediaBase64)) {
     return res.status(400).json({ 
       success: false, 
-      error: 'Bad Request: "number" and "message" fields are required.' 
+      error: 'Bad Request: "number" and either "message", "mediaUrl", or "mediaBase64" fields are required.' 
     });
   }
 
@@ -478,10 +504,31 @@ app.post('/send', authenticate, async (req, res) => {
       chatId = `${cleaned}@c.us`;
     }
 
-    console.log(`[WhatsApp API] Sending message to ${chatId}: "${message}"`);
-    
-    // 4. Send Message via whatsapp-web.js client
-    const response = await client.sendMessage(chatId, message);
+    // 4. Resolve Media Attachment if present
+    let media = null;
+    if (mediaUrl) {
+      console.log(`[WhatsApp API] Downloading attachment from URL: ${mediaUrl}`);
+      media = await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true });
+    } else if (mediaBase64) {
+      if (!mimetype) {
+        return res.status(400).json({
+          success: false,
+          error: 'Bad Request: "mimetype" is required when sending base64 media attachment.'
+        });
+      }
+      console.log(`[WhatsApp API] Parsing Base64 media attachment (${mimetype})`);
+      media = new MessageMedia(mimetype, mediaBase64, filename || 'attachment');
+    }
+
+    let response;
+    if (media) {
+      console.log(`[WhatsApp API] Sending media to ${chatId} with caption: "${message || ''}"`);
+      // When sending media, message acts as the caption
+      response = await client.sendMessage(chatId, media, message ? { caption: message } : {});
+    } else {
+      console.log(`[WhatsApp API] Sending text message to ${chatId}: "${message}"`);
+      response = await client.sendMessage(chatId, message);
+    }
 
     return res.status(200).json({
       success: true,
@@ -506,3 +553,21 @@ app.listen(PORT, () => {
   console.log(`[Server] WhatsApp Lite API Server running on http://localhost:${PORT}`);
   console.log(`[Server] Status & QR scanner dashboard available at http://localhost:${PORT}/status`);
 });
+
+// Clean shutdown handler to prevent lingering Chromium processes and locked sessions
+const cleanShutdown = async () => {
+  console.log('\n[Server] Received shutdown signal. Cleaning up resources...');
+  try {
+    if (client) {
+      await client.destroy();
+      console.log('[Server] Headless browser closed cleanly. Folder locks released.');
+    }
+  } catch (err) {
+    console.error('[Server] Error during client destruction:', err);
+  }
+  console.log('[Server] Goodbye!');
+  process.exit(0);
+};
+
+process.on('SIGINT', cleanShutdown);
+process.on('SIGTERM', cleanShutdown);

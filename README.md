@@ -40,22 +40,20 @@ Make sure you have Node.js (v18+) installed.
 
 ---
 
-### 2. Running with Docker 🐳
+### 2. Running with Docker Compose 🐳
 
-1. **Build the Docker Image:**
+We provide a pre-configured `docker-compose.yml` to orchestrate building and volume-persisting your API with a single command:
+
+1. **Start the API Server (Builds and runs in background):**
    ```bash
-   docker build -t whatsapp-lite-api .
+   docker compose up -d
    ```
-2. **Run the Docker Container:**
-   Mount a volume to persist your authenticated WhatsApp sessions across restarts:
+2. **Access the Console:**
+   Open `http://localhost:3000/status` in your browser to view your self-healing developer console and scan the QR code.
+3. **Stop the Container:**
    ```bash
-   docker run -d \
-     -p 3000:3000 \
-     -v $(pwd)/.wwebjs_auth:/usr/src/app/.wwebjs_auth \
-     --name whatsapp-api \
-     whatsapp-lite-api
+   docker compose down
    ```
-3. Open `http://localhost:3000/status` to scan the QR code.
 
 ---
 
@@ -80,20 +78,45 @@ Checks current connection state and exposes QR code if login is required.
   }
   ```
 
-### 2. Send Message
-Sends a text message to a specific number.
+### 2. Send Message (Text & File Attachments)
+Sends a plain text message, a file attachment from a URL, or a file attachment from a Base64-encoded string. If a `message` is passed alongside media, it will be delivered as the caption of that media.
+
 - **URL:** `/send`
 - **Method:** `POST`
 - **Headers:** 
   - `Content-Type: application/json`
   - `X-API-Key: your_optional_secret_api_key` (if `API_KEY` is set in `.env`)
-- **JSON Request Body:**
-  ```json
-  {
-    "number": "+1 234 567 8900",
-    "message": "Hello from my custom WhatsApp API! 🚀"
-  }
-  ```
+
+#### Request Payloads
+
+##### Option A: Standard Text Message
+```json
+{
+  "number": "+1 234 567 8900",
+  "message": "Hello from my custom WhatsApp API! 🚀"
+}
+```
+
+##### Option B: Send File from a URL (e.g. Image, PDF, Document)
+```json
+{
+  "number": "+1 234 567 8900",
+  "mediaUrl": "https://www.open-wa.org/assets/openwa_logo.webp",
+  "message": "Check out this logo! 🖼️" 
+}
+```
+
+##### Option C: Send File via Base64 Payload
+```json
+{
+  "number": "+1 234 567 8900",
+  "mediaBase64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=",
+  "mimetype": "image/png",
+  "filename": "pixel.png",
+  "message": "Here is a tiny transparent pixel image!"
+}
+```
+
 - **Sample Success Response (200 OK):**
   ```json
   {
