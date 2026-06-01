@@ -6,7 +6,7 @@ services:
     container_name: whatsapp-lite-api
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "10000:10000"
     volumes:
       # Mounts the current directory into the container
       - .:/usr/src/app
@@ -15,7 +15,7 @@ services:
     working_dir: /usr/src/app
     # Set Puppeteer executable path to the container-installed Chromium
     environment:
-      - PORT=3000
+      - PORT=10000
       - PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
       - PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
       - API_KEY= # Set your secret API key here to secure the endpoints
