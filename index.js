@@ -19,7 +19,8 @@ process.on('uncaughtException', (err, origin) => {
 });
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '60mb' }));
+app.use(express.urlencoded({ limit: '60mb', extended: true }));
 
 const PORT = process.env.PORT || 10000;
 const API_KEY = process.env.API_KEY || 'Narzo50pro@gmail.com';
