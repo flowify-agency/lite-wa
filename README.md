@@ -12,6 +12,8 @@ This API exposes a simple POST endpoint to send messages and features an elegant
 - **Dynamic Dual QR Code:** Prints the QR code directly to your terminal console, AND exposes a sleek dark-themed browser dashboard `/status` that displays the live QR code and reloads dynamically upon state changes.
 - **Robust Phone Formatter:** Cleanses inputs automatically. Accepts `+xxx xxxxxxxxxx`, local numbers, or spaces and reformats them perfectly for WhatsApp delivery.
 - **Dockerized:** Out-of-the-box support for containerization, pre-packaged with all dependencies required for running headless Chrome in Linux.
+- **Self-Healing Recovery:** Automatically detects expired/unlinked sessions (from phone logout or auth failure). It purges invalid cached credentials cleanly and re-provisions a fresh scanner session with a new QR code automatically.
+- **High-Capacity Payloads:** Express payload limit is set to `60MB`, allowing massive Base64 files, high-resolution media, and audio attachments.
 
 ---
 
@@ -146,3 +148,21 @@ Sends a plain text message, a file attachment from a URL, a file attachment from
 - **Local Cache Persistence:** All session assets are cached under `.wwebjs_auth/`. Backing up or persisting this folder ensures your credentials are saved.
 - **Resilient Chrome Launch Flags:** Uses `--no-sandbox`, `--disable-setuid-sandbox`, and `--disable-dev-shm-usage` flags inside the container, resolving system level locks or Chrome sandbox crashes automatically.
 - **Signal Handling:** Docker executes the server using `dumb-init` as `PID 1`, allowing seamless propagation of SIGTERM/SIGINT signals so child Chromium processes terminate properly.
+
+---
+
+## Testing & Validation 🧪
+
+We provide comprehensive automated test utilities to verify the health of your gateway endpoints:
+
+### 1. Endpoint Integration Test
+Validate status formatting, authorization controls, phone validation, message queueing, and session purging in one command:
+```bash
+node test_curl.js
+```
+
+### 2. Live Payload Dispatch Test
+Sequentially send a battery of 5 different test messages (text, visual image, caption card, playable inline audio, and interactive location map) to a target recipient:
+```bash
+node send_test_payloads.js
+```
