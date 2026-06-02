@@ -29,7 +29,7 @@ Make sure you have Node.js (v18+) installed.
 2. **Configure optional environment variables:**
    Create a `.env` file in the root:
    ```env
-   PORT=3000
+   PORT=10000
    API_KEY=your_optional_secret_api_key
    ```
 3. **Start the API server:**
@@ -38,7 +38,7 @@ Make sure you have Node.js (v18+) installed.
    ```
 4. **Link WhatsApp:**
    - Watch your terminal console logs; a scan-ready QR code will be printed.
-   - Or, open `http://localhost:3000/status` in your browser to view a beautiful, dynamically refreshed dark-mode QR code, and scan it with your phone (WhatsApp -> Linked Devices).
+   - Or, open `http://localhost:10000/status` in your browser to view a beautiful, dynamically refreshed dark-mode QR code, and scan it with your phone (WhatsApp -> Linked Devices).
 
 ---
 
@@ -51,7 +51,7 @@ We provide a pre-configured `docker-compose.yml` to orchestrate building and vol
    docker compose up -d
    ```
 2. **Access the Console:**
-   Open `http://localhost:3000/status` in your browser to view your self-healing developer console and scan the QR code.
+   Open `http://localhost:10000/status` in your browser to view your self-healing developer console and scan the QR code.
 3. **Stop the Container:**
    ```bash
    docker compose down
