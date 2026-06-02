@@ -79,6 +79,7 @@ const processQueue = async (clientId) => {
         }
       }
       const hasLocation = latitude !== undefined && longitude !== undefined;
+      let response;
 
       if (hasLocation) {
         const locationObj = new Location(parseFloat(latitude), parseFloat(longitude), { name: name || '', address: address || '' });
@@ -211,10 +212,35 @@ const getOrInitializeClient = async (clientId) => {
     }, 15000); // 15 seconds
   });
 
-  client.on('auth_failure', (msg) => {
+  client.on('auth_failure', async (msg) => {
     clientSession.state = 'FAILED';
     if (clientSession.readyTimeout) clearTimeout(clientSession.readyTimeout);
     console.error(`[WhatsApp API] [${clientId}] Authentication failed:`, msg);
+    
+    console.log(`[WhatsApp API] [${clientId}] Purging invalid/expired session cache and re-provisioning fresh client...`);
+    try {
+      await client.destroy();
+    } catch (destroyErr) {
+      console.error(`[WhatsApp API] [${clientId}] Error destroying client during auth failure cleanup:`, destroyErr.message);
+    }
+    
+    const sessionPath = getSessionFolder(clientId);
+    if (fs.existsSync(sessionPath)) {
+      try {
+        fs.rmSync(sessionPath, { recursive: true, force: true });
+        console.log(`[WhatsApp API] [${clientId}] Expired/invalid session cache directory removed cleanly.`);
+      } catch (rmErr) {
+        console.error(`[WhatsApp API] [${clientId}] Failed to remove session cache directory:`, rmErr.message);
+      }
+    }
+    
+    // Remove from in-memory clients registry to trigger fresh provisioning
+    delete clients[clientId];
+    
+    // Boot a fresh client instance to get a new QR code
+    getOrInitializeClient(clientId).catch(err => {
+      console.error(`[WhatsApp API] [${clientId}] Failed to re-provision fresh client session after auth failure:`, err);
+    });
   });
 
   client.on('ready', () => {
@@ -264,13 +290,13 @@ const getOrInitializeClient = async (clientId) => {
       console.error(`[WhatsApp API] [${clientId}] Error destroying client during disconnect:`, destroyErr.message);
     }
 
-    // 2. If it was a logout, remove the cache folder to prevent corrupted session loads
-    if (reason === 'LOGOUT') {
+    // 2. If it was a logout or navigation disconnect (unlinking), remove the cache folder to prevent corrupted session loads
+    if (reason === 'LOGOUT' || reason === 'NAVIGATION') {
       const sessionPath = getSessionFolder(clientId);
       if (fs.existsSync(sessionPath)) {
         try {
           fs.rmSync(sessionPath, { recursive: true, force: true });
-          console.log(`[WhatsApp API] [${clientId}] Session cache directory removed cleanly after LOGOUT.`);
+          console.log(`[WhatsApp API] [${clientId}] Session cache directory removed cleanly after disconnect (${reason}).`);
         } catch (rmErr) {
           console.error(`[WhatsApp API] [${clientId}] Failed to remove session cache directory:`, rmErr.message);
         }
@@ -411,7 +437,7 @@ app.post('/disconnect', authenticate, async (req, res) => {
 
     return res.status(200).json({ success: true, message: `Session ${cleanId} disconnected and fully purged.` });
   } catch (err) {
-    console.error(`[WhatsApp API] [${clientId}] Error during disconnect:`, err);
+    console.error(`[WhatsApp API] [${cleanId}] Error during disconnect:`, err);
     return res.status(500).json({ success: false, error: 'Failed to disconnect session', details: err.message });
   }
 });
