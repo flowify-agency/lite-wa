@@ -9,6 +9,15 @@ const fs = require('fs');
 // Load environment variables
 dotenv.config();
 
+// Global crash mitigation for Puppeteer and third-party unhandled errors (e.g. "Execution context was destroyed" during phone logout)
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[Process Alert] Caught Unhandled Rejection:', reason);
+});
+
+process.on('uncaughtException', (err, origin) => {
+  console.error('[Process Alert] Caught Uncaught Exception:', err.message, 'at:', origin);
+});
+
 const app = express();
 app.use(express.json());
 
@@ -20,6 +29,93 @@ const clients = {};
 
 // In-memory array to log all incoming and outgoing messages (capped at 200 items)
 const messagesLog = [];
+
+// In-memory message queues to hold messages for non-ready client sessions
+const messageQueue = {};
+
+// Helper to process held/queued messages for a client session when it becomes READY
+const processQueue = async (clientId) => {
+  const session = clients[clientId];
+  if (!session || session.state !== 'READY') return;
+
+  const queue = messageQueue[clientId] || [];
+  if (queue.length === 0) return;
+
+  console.log(`[WhatsApp API] [${clientId}] Starting transmission of ${queue.length} held messages...`);
+
+  // To prevent race conditions, copy the queue and clear the original
+  const messagesToProcess = [...queue];
+  messageQueue[clientId] = [];
+
+  for (const msgData of messagesToProcess) {
+    try {
+      // Small staggered delay between sending to be gentle on Puppeteer & WhatsApp rate limits
+      await new Promise(resolve => setTimeout(resolve, 1500));
+
+      // Re-check session state in case it disconnected mid-processing
+      if (session.state !== 'READY') {
+        console.log(`[WhatsApp API] [${clientId}] Session disconnected during queue processing! Re-queueing remaining ${messagesToProcess.slice(messagesToProcess.indexOf(msgData)).length} messages.`);
+        messageQueue[clientId] = [...messagesToProcess.slice(messagesToProcess.indexOf(msgData)), ...messageQueue[clientId]];
+        break;
+      }
+
+      const { number, message, mediaUrl, mediaBase64, mimetype, filename, latitude, longitude, name, address } = msgData;
+
+      let cleaned = number.replace(/\D/g, '');
+      let chatId;
+      const client = session.client;
+      if (number.endsWith('@c.us') || number.endsWith('@g.us')) {
+        chatId = number;
+      } else {
+        try {
+          const numberId = await client.getNumberId(cleaned);
+          if (numberId) {
+            chatId = numberId._serialized;
+          } else {
+            chatId = `${cleaned}@c.us`;
+          }
+        } catch (e) {
+          chatId = `${cleaned}@c.us`;
+        }
+      }
+      const hasLocation = latitude !== undefined && longitude !== undefined;
+
+      if (hasLocation) {
+        const locationObj = new Location(parseFloat(latitude), parseFloat(longitude), { name: name || '', address: address || '' });
+        response = await client.sendMessage(chatId, locationObj);
+      } else if (mediaUrl) {
+        const media = await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true });
+        response = await client.sendMessage(chatId, media, message ? { caption: message } : {});
+      } else if (mediaBase64) {
+        const media = new MessageMedia(mimetype, mediaBase64, filename || 'attachment');
+        response = await client.sendMessage(chatId, media, message ? { caption: message } : {});
+      } else {
+        response = await client.sendMessage(chatId, message);
+      }
+
+      console.log(`[WhatsApp API] [${clientId}] Held message successfully sent to ${chatId}`);
+
+      // Log outgoing message in-memory
+      messagesLog.unshift({
+        id: response.id._serialized,
+        timestamp: new Date().toLocaleTimeString(),
+        clientId: clientId,
+        type: 'outgoing',
+        from: session.clientInfo ? session.clientInfo.number : 'Self',
+        to: chatId.replace('@c.us', '').replace('@g.us', ''),
+        body: message || (mediaUrl ? `[Media URL: ${mediaUrl}]` : mediaBase64 ? '[Base64 Media]' : '[Location Card]'),
+        status: 'SENT'
+      });
+
+      if (messagesLog.length > 200) {
+        messagesLog.pop();
+      }
+
+    } catch (err) {
+      console.error(`[WhatsApp API] [${clientId}] Failed to send held message to ${msgData.number}:`, err);
+    }
+  }
+};
 
 // Helper to check if a session folder exists on disk
 const getSessionFolder = (clientId) => {
@@ -129,6 +225,9 @@ const getOrInitializeClient = async (clientId) => {
       pushname: client.info.pushname
     };
     console.log(`[WhatsApp API] [${clientId}] Client is fully READY as +${clientSession.clientInfo.number} (${clientSession.clientInfo.pushname})!`);
+    
+    // Process any held/queued messages for this client!
+    processQueue(clientId);
   });
 
   client.on('message', async (msg) => {
@@ -149,24 +248,75 @@ const getOrInitializeClient = async (clientId) => {
     }
   });
 
-  client.on('disconnected', (reason) => {
+  client.on('disconnected', async (reason) => {
     clientSession.state = 'DISCONNECTED';
     if (clientSession.readyTimeout) clearTimeout(clientSession.readyTimeout);
     clientSession.clientInfo = null;
     clientSession.qrData = null;
     clientSession.qrBase64 = null;
-    console.log(`[WhatsApp API] [${clientId}] Client was disconnected:`, reason);
+    console.log(`[WhatsApp API] [${clientId}] Client was disconnected (reason: ${reason}). Cleaning up...`);
     
-    // Re-initialize client
-    console.log(`[WhatsApp API] [${clientId}] Re-initializing connection...`);
-    client.initialize().catch(err => {
-      console.error(`[WhatsApp API] [${clientId}] Failed to re-initialize client:`, err);
+    try {
+      // 1. Destroy the old Puppeteer instance cleanly to release file locks
+      await client.destroy();
+      console.log(`[WhatsApp API] [${clientId}] Old Puppeteer client instance destroyed successfully.`);
+    } catch (destroyErr) {
+      console.error(`[WhatsApp API] [${clientId}] Error destroying client during disconnect:`, destroyErr.message);
+    }
+
+    // 2. If it was a logout, remove the cache folder to prevent corrupted session loads
+    if (reason === 'LOGOUT') {
+      const sessionPath = getSessionFolder(clientId);
+      if (fs.existsSync(sessionPath)) {
+        try {
+          fs.rmSync(sessionPath, { recursive: true, force: true });
+          console.log(`[WhatsApp API] [${clientId}] Session cache directory removed cleanly after LOGOUT.`);
+        } catch (rmErr) {
+          console.error(`[WhatsApp API] [${clientId}] Failed to remove session cache directory:`, rmErr.message);
+        }
+      }
+    }
+
+    // 3. Re-initialize a fresh client instance to get a new QR code scanner
+    console.log(`[WhatsApp API] [${clientId}] Re-provisioning a fresh client session...`);
+    
+    // Delete the active clients map reference so getOrInitializeClient will create a brand new client instance!
+    delete clients[clientId];
+    
+    // Call getOrInitializeClient to spin up a fresh client session cleanly
+    getOrInitializeClient(clientId).catch(err => {
+      console.error(`[WhatsApp API] [${clientId}] Failed to re-provision fresh client session:`, err);
     });
   });
 
-  client.initialize().catch(err => {
-    console.error(`[WhatsApp API] [${clientId}] Failed to initialize client:`, err);
-    clientSession.state = 'FAILED';
+  client.initialize().catch(async (err) => {
+    console.error(`[WhatsApp API] [${clientId}] Failed to initialize client:`, err.message);
+    
+    // Self-heal: If initialization fails due to Puppeteer context destruction or protocol errors (corrupted session cache), purge and retry fresh.
+    if (err.message.includes('destroyed') || err.message.includes('Protocol error') || err.message.includes('Session')) {
+      console.log(`[WhatsApp API] [${clientId}] Session cache folder appears to be corrupted or logged out. Purging and retrying connection...`);
+      try {
+        await client.destroy();
+      } catch (destroyErr) {}
+      
+      const sessionPath = getSessionFolder(clientId);
+      if (fs.existsSync(sessionPath)) {
+        try {
+          fs.rmSync(sessionPath, { recursive: true, force: true });
+          console.log(`[WhatsApp API] [${clientId}] Corrupted session cache directory deleted successfully.`);
+        } catch (rmErr) {
+          console.error(`[WhatsApp API] [${clientId}] Failed to purge corrupted session directory:`, rmErr.message);
+        }
+      }
+      
+      // Delete from client registry and spawn a fresh client cleanly
+      delete clients[clientId];
+      getOrInitializeClient(clientId).catch(retryErr => {
+        console.error(`[WhatsApp API] [${clientId}] Failed to re-provision clean client during self-healing:`, retryErr);
+      });
+    } else {
+      clientSession.state = 'FAILED';
+    }
   });
 
   return clientSession;
@@ -202,6 +352,12 @@ app.post('/register', authenticate, async (req, res) => {
     return res.status(400).json({ success: false, error: 'Bad Request: "clientId" contains invalid characters.' });
   }
 
+  // Ensure the cleaned ID is exactly a 10-digit phone number
+  const isTenDigit = /^\d{10}$/.test(cleanId);
+  if (!isTenDigit) {
+    return res.status(400).json({ success: false, error: 'Bad Request: "clientId" must be exactly a 10-digit phone number.' });
+  }
+
   if (clients[cleanId]) {
     return res.status(400).json({ success: false, error: `Bad Request: Session already active for client ID: ${cleanId}` });
   }
@@ -225,12 +381,18 @@ app.post('/disconnect', authenticate, async (req, res) => {
     return res.status(400).json({ success: false, error: 'Bad Request: "clientId" is required.' });
   }
 
-  const session = clients[clientId];
-  if (!session) {
-    return res.status(404).json({ success: false, error: `Not Found: No active session for client ID: ${clientId}` });
+  // Clean and sanitize to prevent space and character issues
+  const cleanId = clientId.trim().replace(/[^a-zA-Z0-9_\-+@.]/g, '');
+  if (!/^\d{10}$/.test(cleanId)) {
+    return res.status(400).json({ success: false, error: 'Bad Request: "clientId" must be exactly a 10-digit phone number.' });
   }
 
-  console.log(`[WhatsApp API] [${clientId}] Disconnecting and destroying session...`);
+  const session = clients[cleanId];
+  if (!session) {
+    return res.status(404).json({ success: false, error: `Not Found: No active session for client ID: ${cleanId}` });
+  }
+
+  console.log(`[WhatsApp API] [${cleanId}] Disconnecting and destroying session...`);
   try {
     if (session.readyTimeout) clearTimeout(session.readyTimeout);
     
@@ -238,16 +400,16 @@ app.post('/disconnect', authenticate, async (req, res) => {
     await session.client.destroy();
     
     // Remove from in-memory registry
-    delete clients[clientId];
+    delete clients[cleanId];
     
     // Clean up session folder from disk
-    const sessionPath = getSessionFolder(clientId);
+    const sessionPath = getSessionFolder(cleanId);
     if (fs.existsSync(sessionPath)) {
       fs.rmSync(sessionPath, { recursive: true, force: true });
-      console.log(`[WhatsApp API] [${clientId}] Session cache directory removed cleanly.`);
+      console.log(`[WhatsApp API] [${cleanId}] Session cache directory removed cleanly.`);
     }
 
-    return res.status(200).json({ success: true, message: `Session ${clientId} disconnected and fully purged.` });
+    return res.status(200).json({ success: true, message: `Session ${cleanId} disconnected and fully purged.` });
   } catch (err) {
     console.error(`[WhatsApp API] [${clientId}] Error during disconnect:`, err);
     return res.status(500).json({ success: false, error: 'Failed to disconnect session', details: err.message });
@@ -276,7 +438,9 @@ app.get('/status', (req, res) => {
         state: session.state,
         authenticated: ['AUTHENTICATED', 'READY'].includes(session.state),
         clientInfo: session.clientInfo,
-        qrCodeAvailable: !!session.qrBase64
+        qrCodeAvailable: !!session.qrBase64,
+        qrBase64: session.qrBase64,
+        queuedCount: (messageQueue[targetClientId] || []).length
       });
     } else {
       const list = Object.keys(clients).map(id => ({
@@ -284,7 +448,9 @@ app.get('/status', (req, res) => {
         state: clients[id].state,
         authenticated: ['AUTHENTICATED', 'READY'].includes(clients[id].state),
         clientInfo: clients[id].clientInfo,
-        qrCodeAvailable: !!clients[id].qrBase64
+        qrCodeAvailable: !!clients[id].qrBase64,
+        qrBase64: clients[id].qrBase64,
+        queuedCount: (messageQueue[id] || []).length
       }));
       return res.json({ success: true, clients: list, messages: messagesLog });
     }
@@ -317,6 +483,18 @@ app.get('/status', (req, res) => {
         </div>
 
         <div class="content-section">
+          ${(messageQueue[targetClientId] && messageQueue[targetClientId].length > 0) ? `
+            <div style="background-color: var(--amber-bg); border: 1px solid var(--amber); border-radius: 8px; padding: 0.75rem; margin-bottom: 1.25rem; display: flex; align-items: flex-start; gap: 0.5rem; color: var(--amber); font-size: 0.8125rem; line-height: 1.4;">
+              <svg class="svg-icon" style="width: 16px; height: 16px; color: var(--amber); flex-shrink: 0; margin-top: 2px;" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+              </svg>
+              <div>
+                <strong>${messageQueue[targetClientId].length} Messages Held</strong><br>
+                These messages are held in queue and will be transmitted automatically once you link a device and the state becomes <strong>READY</strong>.
+              </div>
+            </div>
+          ` : ''}
+
           ${session.state === 'QR_REQUIRED' && session.qrBase64 ? `
             <p class="instruction-text">To start automating, link a device by scanning this QR code in WhatsApp (Settings &rarr; Linked Devices):</p>
             <div class="qr-wrapper">
@@ -418,6 +596,15 @@ app.get('/status', (req, res) => {
                 <div style="font-size: 0.8125rem; line-height: 1.4;">
                   <div style="margin-bottom: 0.25rem;"><strong style="color: var(--text-primary)">Name:</strong> ${session.clientInfo?.pushname || 'N/A'}</div>
                   <div><strong style="color: var(--text-primary)">Phone:</strong> +${session.clientInfo?.number || 'N/A'}</div>
+                </div>
+              ` : ''}
+              
+              ${(messageQueue[id] && messageQueue[id].length > 0) ? `
+                <div style="margin-top: 0.5rem; font-size: 0.8125rem; color: var(--amber); display: flex; align-items: center; gap: 0.25rem;">
+                  <svg class="svg-icon" style="color: var(--amber);" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                  </svg>
+                  <span><strong>${messageQueue[id].length}</strong> messages held in queue</span>
                 </div>
               ` : ''}
               
@@ -635,6 +822,15 @@ app.get('/status', (req, res) => {
                     <div style="font-size: 0.8125rem; line-height: 1.4;">
                       <div style="margin-bottom: 0.25rem;"><strong style="color: var(--text-primary)">Name:</strong> \${escapeHtml(session.clientInfo.pushname || 'N/A')}</div>
                       <div><strong style="color: var(--text-primary)">Phone:</strong> +\${escapeHtml(session.clientInfo.number || 'N/A')}</div>
+                    </div>
+                  \` : ''}
+                  
+                  \${session.queuedCount > 0 ? \`
+                    <div style="margin-top: 0.5rem; font-size: 0.8125rem; color: var(--amber); display: flex; align-items: center; gap: 0.25rem;">
+                      <svg class="svg-icon" style="color: var(--amber);" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                      </svg>
+                      <span><strong>\${session.queuedCount}</strong> messages held in queue</span>
                     </div>
                   \` : ''}
                   
@@ -1119,19 +1315,55 @@ app.post('/send', authenticate, async (req, res) => {
     }
   }
 
-  const session = clients[targetClientId];
-  if (!session) {
+  // Trim and sanitize targetClientId to prevent space and character issues (e.g. " 7033769997" -> "7033769997")
+  targetClientId = targetClientId.trim().replace(/[^a-zA-Z0-9_\-+@.]/g, '');
+
+  // Ensure the resolved client ID is exactly a 10-digit phone number
+  if (!/^\d{10}$/.test(targetClientId)) {
     return res.status(400).json({
       success: false,
-      error: `Bad Request: No session found for client ID: "${targetClientId}". Please initialize it first by visiting the dashboard.`
+      error: 'Bad Request: "clientId" must be exactly a 10-digit phone number.'
     });
   }
 
-  // 3. Ensure connection state is READY for that client
+  let session = clients[targetClientId];
+  if (!session) {
+    console.log(`[WhatsApp API] [${targetClientId}] Session not active in memory. Auto-provisioning...`);
+    try {
+      session = await getOrInitializeClient(targetClientId);
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: `Failed to auto-initialize session for client ID: ${targetClientId}`,
+        details: err.message
+      });
+    }
+  }
+
+  // 3. Ensure connection state is READY for that client (otherwise hold in queue)
   if (session.state !== 'READY') {
-    return res.status(503).json({ 
-      success: false, 
-      error: `Service Unavailable: WhatsApp Gateway for client "${targetClientId}" is in state: ${session.state}. Visit the dashboard to scan QR code.` 
+    if (!messageQueue[targetClientId]) {
+      messageQueue[targetClientId] = [];
+    }
+    messageQueue[targetClientId].push({
+      number, message, mediaUrl, mediaBase64, mimetype, filename, latitude, longitude, name, address
+    });
+
+    console.log(`[WhatsApp API] [${targetClientId}] Message held in queue (state: ${session.state}). Held count: ${messageQueue[targetClientId].length}`);
+
+    let userFriendlyMsg = `We don't have any active session for client "${targetClientId}". Please scan the QR code to continue.`;
+    if (session.state === 'INITIALIZING') {
+      userFriendlyMsg = `We don't have any active session for client "${targetClientId}". Initializing session in background... Please scan the QR code once it appears to continue.`;
+    }
+
+    return res.status(200).json({
+      success: true,
+      status: 'HOLD',
+      message: userFriendlyMsg,
+      clientId: targetClientId,
+      state: session.state,
+      qrCodeAvailable: !!session.qrBase64,
+      qrBase64: session.qrBase64
     });
   }
 
@@ -1139,14 +1371,23 @@ app.post('/send', authenticate, async (req, res) => {
     // 4. Clean and parse number
     let cleaned = number.replace(/\D/g, '');
     let chatId;
+    const client = session.client;
     if (number.endsWith('@c.us') || number.endsWith('@g.us')) {
       chatId = number;
     } else {
-      chatId = `${cleaned}@c.us`;
+      try {
+        const numberId = await client.getNumberId(cleaned);
+        if (numberId) {
+          chatId = numberId._serialized;
+        } else {
+          chatId = `${cleaned}@c.us`;
+        }
+      } catch (e) {
+        chatId = `${cleaned}@c.us`;
+      }
     }
 
     let response;
-    const client = session.client;
 
     // 5. Send Location Card if provided
     if (hasLocation) {
@@ -1236,7 +1477,27 @@ app.listen(PORT, async () => {
   if (fs.existsSync(authDir)) {
     try {
       const files = fs.readdirSync(authDir);
-      const sessionDirs = files.filter(f => f.startsWith('session-') && fs.statSync(path.join(authDir, f)).isDirectory());
+      const sessionDirs = [];
+      
+      for (const f of files) {
+        if (f.startsWith('session-')) {
+          const fullPath = path.join(authDir, f);
+          try {
+            if (fs.statSync(fullPath).isDirectory()) {
+              const clientId = f.substring('session-'.length);
+              if (/^\d{10}$/.test(clientId)) {
+                sessionDirs.push(f);
+              } else {
+                // Self-heal: Clean up non-10 digit corrupted session folders
+                console.log(`[Server] Self-Healing: Removing invalid/corrupted session folder from disk: ${f}`);
+                fs.rmSync(fullPath, { recursive: true, force: true });
+              }
+            }
+          } catch (err) {
+            console.error(`[Server] Error processing session folder ${f}:`, err.message);
+          }
+        }
+      }
       
       if (sessionDirs.length > 0) {
         console.log(`[Server] Found ${sessionDirs.length} existing sessions to auto-load. Booting sequentially...`);
